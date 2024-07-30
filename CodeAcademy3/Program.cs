@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
@@ -7,6 +7,7 @@ public class Program
 {
     public static void Main(string[] args)
     {
+        // Load accounts from file, initialize services, and run the ATM
         var accounts = FileOperations.LoadAccounts();
         var accountRepository = new AccountRepository(accounts);
         var bankService = new BankService(accountRepository);
@@ -14,6 +15,7 @@ public class Program
 
         atm.Run();
 
+        // Save updated account information back to file
         FileOperations.SaveAccounts(accounts);
     }
 }
@@ -90,7 +92,8 @@ public class BankService : IBankService
         if (account == null || account.Balance < requestedAmount)
             return false;
 
-        if (requestedAmount > 1000 || GetTodayTransactionsCount(accountId) >= 10)
+        // Check daily withdrawal limits
+        if (IsWithdrawalLimitExceeded(accountId, requestedAmount))
         {
             Console.WriteLine("Daily withdrawal limit exceeded. Maximum 10 withdrawals or $1000 per day.");
             return false;
@@ -101,17 +104,27 @@ public class BankService : IBankService
         if (actualAmount == 0)
             return false;
 
-        account.Balance -= actualAmount;
+        // Update account balance and add transaction
+        UpdateAccountBalance(account, actualAmount);
+        _accountRepository.Update(account);
+        return true;
+    }
+
+    private bool IsWithdrawalLimitExceeded(Guid accountId, decimal amount)
+    {
+        return amount > 1000 || GetTodayTransactionsCount(accountId) >= 10;
+    }
+
+    private void UpdateAccountBalance(BankAccount account, decimal amount)
+    {
+        account.Balance -= amount;
         account.Transactions.Add(new Transaction
         {
             Id = Guid.NewGuid(),
             Date = DateTime.Now,
-            Amount = -actualAmount,
+            Amount = -amount,
             Type = "Withdrawal"
         });
-
-        _accountRepository.Update(account);
-        return true;
     }
 
     private int GetTodayTransactionsCount(Guid accountId)
@@ -204,6 +217,19 @@ public class ATM
 
     public void Run()
     {
+        // Authenticate user with a maximum of 3 attempts
+        if (!AuthenticateUser())
+        {
+            Console.WriteLine("Too many failed attempts. The program will now exit.");
+            Environment.Exit(0);
+        }
+
+        // If authentication successful, show main menu
+        MainMenu();
+    }
+
+    private bool AuthenticateUser()
+    {
         int attempts = 0;
         while (attempts < 3)
         {
@@ -217,8 +243,7 @@ public class ATM
             if (_bankService.ValidateCard(cardNumber, pin))
             {
                 _currentAccount = _bankService.GetByCardNumber(cardNumber);
-                MainMenu();
-                return;
+                return true;
             }
             else
             {
@@ -227,47 +252,58 @@ public class ATM
                 Console.ReadKey();
             }
         }
-        Console.WriteLine("Too many failed attempts. The program will now exit.");
-        Environment.Exit(0);
+        return false;
     }
 
     private void MainMenu()
     {
         while (true)
         {
-            Console.Clear();
-            Console.WriteLine("1. Check Balance");
-            Console.WriteLine("2. Withdraw Money");
-            Console.WriteLine("3. View Recent Transactions");
-            Console.WriteLine("4. Change PIN");
-            Console.WriteLine("5. Exit");
-            Console.Write("Select an option: ");
+            DisplayMenuOptions();
+            string choice = Console.ReadLine();
+            ProcessMenuChoice(choice);
 
-            switch (Console.ReadLine())
-            {
-               
-                case "1":
-                    CheckBalance();
-                    break;
-                case "2":
-                    WithdrawMoney();
-                    break;
-                case "3":
-                    ViewRecentTransactions();
-                    break;
-                case "4":
-                    ChangePin();
-                    break;
-                case "5":
-                    _currentAccount = null;
-                    return;
-                default:
-                    Console.WriteLine("Invalid option. Please try again.");
-                    break;
-            }
+            if (choice == "5") // Exit option
+                break;
 
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
+        }
+    }
+
+    private void DisplayMenuOptions()
+    {
+        Console.Clear();
+        Console.WriteLine("1. Check Balance");
+        Console.WriteLine("2. Withdraw Money");
+        Console.WriteLine("3. View Recent Transactions");
+        Console.WriteLine("4. Change PIN");
+        Console.WriteLine("5. Exit");
+        Console.Write("Select an option: ");
+    }
+
+    private void ProcessMenuChoice(string choice)
+    {
+        switch (choice)
+        {
+            case "1":
+                CheckBalance();
+                break;
+            case "2":
+                WithdrawMoney();
+                break;
+            case "3":
+                ViewRecentTransactions();
+                break;
+            case "4":
+                ChangePin();
+                break;
+            case "5":
+                _currentAccount = null;
+                break;
+            default:
+                Console.WriteLine("Invalid option. Please try again.");
+                break;
         }
     }
 
