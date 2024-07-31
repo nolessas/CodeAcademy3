@@ -7,16 +7,29 @@ public class Program
 {
     public static void Main(string[] args)
     {
-        // Load accounts from file, initialize services, and run the ATM
-        var accounts = FileOperations.LoadAccounts();
-        var accountRepository = new AccountRepository(accounts);
-        var bankService = new BankService(accountRepository);
-        var atm = new ATM(bankService);
+        List<BankAccount> accounts = null;
+        try
+        {
+            accounts = FileOperations.LoadAccounts();
+            var accountRepository = new AccountRepository(accounts);
+            var bankService = new BankService(accountRepository);
+            var atm = new ATM(bankService, accountRepository);
 
-        atm.Run();
-
-        // Save updated account information back to file
-        FileOperations.SaveAccounts(accounts);
+            atm.Run();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Critical error: {ex.Message}");
+            Console.WriteLine("The program will now exit.");
+        }
+        finally
+        {
+            // Save accounts when exiting, even if an exception occurred
+            if (accounts != null)
+            {
+                FileOperations.SaveAccounts(accounts);
+            }
+        }
     }
 }
 
@@ -88,49 +101,100 @@ public class BankService : IBankService
 
     public bool WithdrawMoney(Guid accountId, decimal requestedAmount)
     {
-        var account = _accountRepository.GetById(accountId);
-        if (account == null || account.Balance < requestedAmount)
-            return false;
-
-        // Check daily withdrawal limits
-        if (IsWithdrawalLimitExceeded(accountId, requestedAmount))
+        try
         {
-            Console.WriteLine("Daily withdrawal limit exceeded. Maximum 10 withdrawals or $1000 per day.");
+            var account = _accountRepository.GetById(accountId);
+            if (account == null)
+                throw new ArgumentException("Account not found");
+            if (account.Balance < requestedAmount)
+                throw new InvalidOperationException("Insufficient funds");
+
+            // Check daily withdrawal limits
+            if (IsWithdrawalLimitExceeded(accountId, requestedAmount))
+            {
+                Console.WriteLine("Daily withdrawal limit exceeded. Maximum 10 withdrawals or $1000 per day.");
+                return false;
+            }
+
+            var (denominations, actualAmount) = CalculateDenominations(requestedAmount);
+
+            if (actualAmount == 0)
+                return false;
+
+            UpdateAccountBalance(account, actualAmount);
+            _accountRepository.Update(account);
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Invalid account: {ex.Message}");
             return false;
         }
-
-        var (denominations, actualAmount) = CalculateDenominations(requestedAmount);
-
-        if (actualAmount == 0)
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine($"Withdrawal failed: {ex.Message}");
             return false;
-
-        // Update account balance and add transaction
-        UpdateAccountBalance(account, actualAmount);
-        _accountRepository.Update(account);
-        return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error during withdrawal: {ex.Message}");
+            return false;
+        }
     }
 
     private bool IsWithdrawalLimitExceeded(Guid accountId, decimal amount)
     {
-        return amount > 1000 || GetTodayTransactionsCount(accountId) >= 10;
+        var todayWithdrawals = GetTodayWithdrawals(accountId);
+        var totalWithdrawnToday = todayWithdrawals.Sum(t => Math.Abs(t.Amount));
+        return (totalWithdrawnToday + amount > 1000) || (todayWithdrawals.Count >= 10);
+    }
+
+    private List<Transaction> GetTodayWithdrawals(Guid accountId)
+    {
+        var account = _accountRepository.GetById(accountId);
+        return account?.Transactions
+            .Where(t => t.Date.Date == DateTime.Today && t.Type == "Withdrawal")
+            .ToList() ?? new List<Transaction>();
     }
 
     private void UpdateAccountBalance(BankAccount account, decimal amount)
     {
-        account.Balance -= amount;
-        account.Transactions.Add(new Transaction
+        try
         {
-            Id = Guid.NewGuid(),
-            Date = DateTime.Now,
-            Amount = -amount,
-            Type = "Withdrawal"
-        });
-    }
+            if (account == null)
+                throw new ArgumentNullException(nameof(account));
+            if (amount <= 0)
+                throw new ArgumentException("Amount must be positive", nameof(amount));
 
-    private int GetTodayTransactionsCount(Guid accountId)
-    {
-        var account = _accountRepository.GetById(accountId);
-        return account?.Transactions.Count(t => t.Date.Date == DateTime.Today && t.Type == "Withdrawal") ?? 0;
+            account.Balance -= amount;
+            account.Transactions.Add(new Transaction
+            {
+                Id = Guid.NewGuid(),
+                Date = DateTime.Now,
+                Amount = -amount,
+                Type = "Withdrawal"
+            });
+        }
+        catch (ArgumentNullException ex)
+        {
+            Console.WriteLine($"Error updating account balance: {ex.Message}");
+            throw;
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Invalid amount: {ex.Message}");
+            throw;
+        }
+        catch (OverflowException ex)
+        {
+            Console.WriteLine($"Arithmetic overflow: {ex.Message}");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error updating account balance: {ex.Message}");
+            throw;
+        }
     }
 
     public (Dictionary<int, int>, decimal) CalculateDenominations(decimal requestedAmount)
@@ -208,11 +272,13 @@ public class AccountRepository : IAccountRepository
 public class ATM
 {
     private readonly IBankService _bankService;
+    private readonly IAccountRepository _accountRepository;
     private BankAccount _currentAccount;
 
-    public ATM(IBankService bankService)
+    public ATM(IBankService bankService, IAccountRepository accountRepository)
     {
         _bankService = bankService;
+        _accountRepository = accountRepository;
     }
 
     public void Run()
@@ -221,7 +287,7 @@ public class ATM
         if (!AuthenticateUser())
         {
             Console.WriteLine("Too many failed attempts. The program will now exit.");
-            Environment.Exit(0);
+            return;
         }
 
         // If authentication successful, show main menu
@@ -234,7 +300,7 @@ public class ATM
         while (attempts < 3)
         {
             Console.Clear();
-            Console.WriteLine("Welcome to the ATM");
+            Console.WriteLine("Welcome to the C++++ ATM");
             Console.Write("Enter card number: ");
             string cardNumber = Console.ReadLine();
             Console.Write("Enter PIN: ");
@@ -264,7 +330,9 @@ public class ATM
             ProcessMenuChoice(choice);
 
             if (choice == "5") // Exit option
+            {
                 break;
+            }
 
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
@@ -273,7 +341,7 @@ public class ATM
 
     private void DisplayMenuOptions()
     {
-        Console.Clear();
+        Console.Clear();//
         Console.WriteLine("Welcome to C++++ ATM");
         Console.WriteLine("1. Check Balance");
         Console.WriteLine("2. Withdraw Money");
@@ -381,54 +449,92 @@ public class FileOperations
 
     public static void SaveAccounts(List<BankAccount> accounts)
     {
-        using (StreamWriter writer = new StreamWriter(FILE_PATH))
+        try
         {
-            foreach (var account in accounts)
+            using (StreamWriter writer = new StreamWriter(FILE_PATH))
             {
-                writer.WriteLine($"{account.Id},{account.CardNumber},{account.Pin},{account.Balance}");
-                foreach (var transaction in account.Transactions)
+                foreach (var account in accounts)
                 {
-                    writer.WriteLine($"T,{transaction.Id},{transaction.Date},{transaction.Amount},{transaction.Type}");
+                    writer.WriteLine($"{account.Id},{account.CardNumber},{account.Pin},{account.Balance}");
+                    foreach (var transaction in account.Transactions)
+                    {
+                        writer.WriteLine($"T,{transaction.Id},{transaction.Date},{transaction.Amount},{transaction.Type}");
+                    }
                 }
             }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"Access denied when saving accounts: {ex.Message}");
+        }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"IO error when saving accounts: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error when saving accounts: {ex.Message}");
         }
     }
 
     public static List<BankAccount> LoadAccounts()
     {
         List<BankAccount> accounts = new List<BankAccount>();
-        if (File.Exists(FILE_PATH))
+        try
         {
-            using (StreamReader reader = new StreamReader(FILE_PATH))
+            if (File.Exists(FILE_PATH))
             {
-                string line;
-                BankAccount currentAccount = null;
-                while ((line = reader.ReadLine()) != null)
+                using (StreamReader reader = new StreamReader(FILE_PATH))
                 {
-                    string[] parts = line.Split(',');
-                    if (parts[0] != "T")
+                    string line;
+                    BankAccount currentAccount = null;
+                    while ((line = reader.ReadLine()) != null)
                     {
-                        currentAccount = new BankAccount
+                        string[] parts = line.Split(',');
+                        if (parts[0] != "T")
                         {
-                            Id = Guid.Parse(parts[0]),
-                            CardNumber = parts[1],
-                            Pin = parts[2],
-                            Balance = decimal.Parse(parts[3])
-                        };
-                        accounts.Add(currentAccount);
-                    }
-                    else
-                    {
-                        currentAccount.Transactions.Add(new Transaction
+                            currentAccount = new BankAccount
+                            {
+                                Id = Guid.Parse(parts[0]),
+                                CardNumber = parts[1],
+                                Pin = parts[2],
+                                Balance = decimal.Parse(parts[3])
+                            };
+                            accounts.Add(currentAccount);
+                        }
+                        else
                         {
-                            Id = Guid.Parse(parts[1]),
-                            Date = DateTime.Parse(parts[2]),
-                            Amount = decimal.Parse(parts[3]),
-                            Type = parts[4]
-                        });
+                            currentAccount.Transactions.Add(new Transaction
+                            {
+                                Id = Guid.Parse(parts[1]),
+                                Date = DateTime.Parse(parts[2]),
+                                Amount = decimal.Parse(parts[3]),
+                                Type = parts[4]
+                            });
+                        }
                     }
                 }
             }
+        }
+        catch (FileNotFoundException ex)
+        {
+            Console.WriteLine($"Account file not found: {ex.Message}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"Access denied when loading accounts: {ex.Message}");
+        }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"IO error when loading accounts: {ex.Message}");
+        }
+        catch (FormatException ex)
+        {
+            Console.WriteLine($"Error parsing account data: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error when loading accounts: {ex.Message}");
         }
         return accounts;
     }

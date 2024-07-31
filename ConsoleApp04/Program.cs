@@ -2,21 +2,35 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
+using System.Text.Json;
 
 public class Program
 {
     public static void Main(string[] args)
     {
-        // Load accounts from file, initialize services, and run the ATM
-        var accounts = FileOperations.LoadAccounts();
-        var accountRepository = new AccountRepository(accounts);
-        var bankService = new BankService(accountRepository);
-        var atm = new ATM(bankService);
+        List<BankAccount> accounts = null;
+        try
+        {
+            accounts = FileOperations.LoadAccounts();
+            var accountRepository = new AccountRepository(accounts);
+            var bankService = new BankService(accountRepository);
+            var atm = new ATM(bankService, accountRepository);
 
-        atm.Run();
-
-        // Save updated account information back to file
-        FileOperations.SaveAccounts(accounts);
+            atm.Run();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Critical error: {ex.Message}");
+            Console.WriteLine("The program will now exit.");
+        }
+        finally
+        {
+            // Save accounts when exiting, even if an exception occurred
+            if (accounts != null)
+            {
+                FileOperations.SaveAccounts(accounts);
+            }
+        }
     }
 }
 
@@ -27,6 +41,23 @@ public class BankAccount
     public string Pin { get; set; }
     public decimal Balance { get; set; }
     public List<Transaction> Transactions { get; set; } = new List<Transaction>();
+
+    public void Deposit(decimal amount)
+    {
+        if (amount <= 0 || amount % 5 != 0)
+        {
+            throw new ArgumentException("Invalid deposit amount. Please use denominations of 5, 10, 20, or 50.");
+        }
+
+        Balance += amount;
+        Transactions.Add(new Transaction
+        {
+            Id = Guid.NewGuid(),
+            Date = DateTime.Now,
+            Amount = amount,
+            Type = "Deposit"
+        });
+    }
 }
 
 public class Transaction
@@ -46,6 +77,7 @@ public interface IBankService
     bool WithdrawMoney(Guid accountId, decimal amount);
     (Dictionary<int, int>, decimal) CalculateDenominations(decimal amount);
     BankAccount GetByCardNumber(string cardNumber);
+    bool DepositMoney(Guid accountId, decimal amount);
 }
 
 public class BankService : IBankService
@@ -88,49 +120,127 @@ public class BankService : IBankService
 
     public bool WithdrawMoney(Guid accountId, decimal requestedAmount)
     {
-        var account = _accountRepository.GetById(accountId);
-        if (account == null || account.Balance < requestedAmount)
-            return false;
-
-        // Check daily withdrawal limits
-        if (IsWithdrawalLimitExceeded(accountId, requestedAmount))
+        try
         {
-            Console.WriteLine("Daily withdrawal limit exceeded. Maximum 10 withdrawals or $1000 per day.");
+            var account = _accountRepository.GetById(accountId);
+            if (account == null)
+                throw new ArgumentException("Account not found");
+            if (account.Balance < requestedAmount)
+                throw new InvalidOperationException("Insufficient funds");
+
+            // Check daily withdrawal limits
+            if (IsWithdrawalLimitExceeded(accountId, requestedAmount))
+            {
+                Console.WriteLine("Daily withdrawal limit exceeded. Maximum 10 withdrawals or $1000 per day.");
+                return false;
+            }
+
+            var (denominations, actualAmount) = CalculateDenominations(requestedAmount);
+
+            if (actualAmount == 0)
+                return false;
+
+            UpdateAccountBalance(account, actualAmount);
+            _accountRepository.Update(account);
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Invalid account: {ex.Message}");
             return false;
         }
-
-        var (denominations, actualAmount) = CalculateDenominations(requestedAmount);
-
-        if (actualAmount == 0)
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine($"Withdrawal failed: {ex.Message}");
             return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error during withdrawal: {ex.Message}");
+            return false;
+        }
+    }
 
-        // Update account balance and add transaction
-        UpdateAccountBalance(account, actualAmount);
-        _accountRepository.Update(account);
-        return true;
+    public bool DepositMoney(Guid accountId, decimal amount)
+    {
+        try
+        {
+            var account = _accountRepository.GetById(accountId);
+            if (account == null)
+                throw new ArgumentException("Account not found");
+
+            if (amount <= 0 || amount % 5 != 0)
+                throw new ArgumentException("Invalid deposit amount. Please use denominations of 5, 10, 20, or 50.");
+
+            account.Deposit(amount);
+            _accountRepository.Update(account);
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Deposit failed: {ex.Message}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error during deposit: {ex.Message}");
+            return false;
+        }
     }
 
     private bool IsWithdrawalLimitExceeded(Guid accountId, decimal amount)
     {
-        return amount > 1000 || GetTodayTransactionsCount(accountId) >= 10;
+        var todayWithdrawals = GetTodayWithdrawals(accountId);
+        var totalWithdrawnToday = todayWithdrawals.Sum(t => Math.Abs(t.Amount));
+        return (totalWithdrawnToday + amount > 1000) || (todayWithdrawals.Count >= 10);
+    }
+
+    private List<Transaction> GetTodayWithdrawals(Guid accountId)
+    {
+        var account = _accountRepository.GetById(accountId);
+        return account?.Transactions
+            .Where(t => t.Date.Date == DateTime.Today && t.Type == "Withdrawal")
+            .ToList() ?? new List<Transaction>();
     }
 
     private void UpdateAccountBalance(BankAccount account, decimal amount)
     {
-        account.Balance -= amount;
-        account.Transactions.Add(new Transaction
+        try
         {
-            Id = Guid.NewGuid(),
-            Date = DateTime.Now,
-            Amount = -amount,
-            Type = "Withdrawal"
-        });
-    }
+            if (account == null)
+                throw new ArgumentNullException(nameof(account));
+            if (amount <= 0)
+                throw new ArgumentException("Amount must be positive", nameof(amount));
 
-    private int GetTodayTransactionsCount(Guid accountId)
-    {
-        var account = _accountRepository.GetById(accountId);
-        return account?.Transactions.Count(t => t.Date.Date == DateTime.Today && t.Type == "Withdrawal") ?? 0;
+            account.Balance -= amount;
+            account.Transactions.Add(new Transaction
+            {
+                Id = Guid.NewGuid(),
+                Date = DateTime.Now,
+                Amount = -amount,
+                Type = "Withdrawal"
+            });
+        }
+        catch (ArgumentNullException ex)
+        {
+            Console.WriteLine($"Error updating account balance: {ex.Message}");
+            throw;
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Invalid amount: {ex.Message}");
+            throw;
+        }
+        catch (OverflowException ex)
+        {
+            Console.WriteLine($"Arithmetic overflow: {ex.Message}");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unexpected error updating account balance: {ex.Message}");
+            throw;
+        }
     }
 
     public (Dictionary<int, int>, decimal) CalculateDenominations(decimal requestedAmount)
@@ -208,11 +318,13 @@ public class AccountRepository : IAccountRepository
 public class ATM
 {
     private readonly IBankService _bankService;
+    private readonly IAccountRepository _accountRepository;
     private BankAccount _currentAccount;
 
-    public ATM(IBankService bankService)
+    public ATM(IBankService bankService, IAccountRepository accountRepository)
     {
         _bankService = bankService;
+        _accountRepository = accountRepository;
     }
 
     public void Run()
@@ -221,7 +333,7 @@ public class ATM
         if (!AuthenticateUser())
         {
             Console.WriteLine("Too many failed attempts. The program will now exit.");
-            Environment.Exit(0);
+            return;
         }
 
         // If authentication successful, show main menu
@@ -234,7 +346,7 @@ public class ATM
         while (attempts < 3)
         {
             Console.Clear();
-            Console.WriteLine("Welcome to the ATM");
+            Console.WriteLine("Welcome to the C++++ ATM");
             Console.Write("Enter card number: ");
             string cardNumber = Console.ReadLine();
             Console.Write("Enter PIN: ");
@@ -263,8 +375,10 @@ public class ATM
             string choice = Console.ReadLine();
             ProcessMenuChoice(choice);
 
-            if (choice == "5") // Exit option
+            if (choice == "6") // Exit option
+            {
                 break;
+            }
 
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
@@ -277,9 +391,10 @@ public class ATM
         Console.WriteLine("Welcome to C++++ ATM");
         Console.WriteLine("1. Check Balance");
         Console.WriteLine("2. Withdraw Money");
-        Console.WriteLine("3. View Recent Transactions");
-        Console.WriteLine("4. Change PIN");
-        Console.WriteLine("5. Exit");
+        Console.WriteLine("3. Deposit Money");
+        Console.WriteLine("4. View Recent Transactions");
+        Console.WriteLine("5. Change PIN");
+        Console.WriteLine("6. Exit");
         Console.Write("Select an option: ");
     }
 
@@ -294,12 +409,15 @@ public class ATM
                 WithdrawMoney();
                 break;
             case "3":
-                ViewRecentTransactions();
+                DepositMoney();
                 break;
             case "4":
-                ChangePin();
+                ViewRecentTransactions();
                 break;
             case "5":
+                ChangePin();
+                break;
+            case "6":
                 _currentAccount = null;
                 break;
             default:
@@ -347,6 +465,26 @@ public class ATM
         }
     }
 
+    private void DepositMoney()
+    {
+        Console.Write("Enter amount to deposit (must be in denominations of 5, 10, 20, or 50): ");
+        if (decimal.TryParse(Console.ReadLine(), out decimal amount))
+        {
+            if (_bankService.DepositMoney(_currentAccount.Id, amount))
+            {
+                Console.WriteLine($"Successfully deposited ${amount}");
+            }
+            else
+            {
+                Console.WriteLine("Deposit failed. Please check the amount and try again.");
+            }
+        }
+        else
+        {
+            Console.WriteLine("Invalid amount entered.");
+        }
+    }
+
     private void ViewRecentTransactions()
     {
         var transactions = _bankService.GetRecentTransactions(_currentAccount.Id, 5);
@@ -377,58 +515,39 @@ public class ATM
 
 public class FileOperations
 {
-    private const string FILE_PATH = "accounts.txt";
+    private const string FILE_PATH = "accounts.json";
 
     public static void SaveAccounts(List<BankAccount> accounts)
     {
-        using (StreamWriter writer = new StreamWriter(FILE_PATH))
+        try
         {
-            foreach (var account in accounts)
-            {
-                writer.WriteLine($"{account.Id},{account.CardNumber},{account.Pin},{account.Balance}");
-                foreach (var transaction in account.Transactions)
-                {
-                    writer.WriteLine($"T,{transaction.Id},{transaction.Date},{transaction.Amount},{transaction.Type}");
-                }
-            }
+            string jsonString = JsonSerializer.Serialize(accounts, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(FILE_PATH, jsonString);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error saving accounts: {ex.Message}");
         }
     }
 
     public static List<BankAccount> LoadAccounts()
     {
         List<BankAccount> accounts = new List<BankAccount>();
-        if (File.Exists(FILE_PATH))
+        try
         {
-            using (StreamReader reader = new StreamReader(FILE_PATH))
+            if (File.Exists(FILE_PATH))
             {
-                string line;
-                BankAccount currentAccount = null;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    string[] parts = line.Split(',');
-                    if (parts[0] != "T")
-                    {
-                        currentAccount = new BankAccount
-                        {
-                            Id = Guid.Parse(parts[0]),
-                            CardNumber = parts[1],
-                            Pin = parts[2],
-                            Balance = decimal.Parse(parts[3])
-                        };
-                        accounts.Add(currentAccount);
-                    }
-                    else
-                    {
-                        currentAccount.Transactions.Add(new Transaction
-                        {
-                            Id = Guid.Parse(parts[1]),
-                            Date = DateTime.Parse(parts[2]),
-                            Amount = decimal.Parse(parts[3]),
-                            Type = parts[4]
-                        });
-                    }
-                }
+                string jsonString = File.ReadAllText(FILE_PATH);
+                accounts = JsonSerializer.Deserialize<List<BankAccount>>(jsonString);
             }
+            else
+            {
+                Console.WriteLine("Accounts file not found. Please ensure 'accounts.json' exists in the program directory.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading accounts: {ex.Message}");
         }
         return accounts;
     }
